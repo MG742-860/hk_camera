@@ -3,6 +3,12 @@ project(hk_camera)
 
 set(CMAKE_CXX_STANDARD 11)
 
+# 海康 MVS 相机 SDK 动态库绝对路径(/opt/MVS/lib/64)。
+# 使用绝对路径而非 link_directories()：后者在 add_library() 之后调用不会
+# 对已创建的目标生效(这正是此前链接命令缺失 -L/opt/MVS/lib/64、
+# 报找不到 -lMvCameraControl 的原因)。
+set(MVS_LIBRARY /opt/MVS/lib/64/libMvCameraControl.so)
+
 find_package(catkin REQUIRED COMPONENTS
         roscpp
         nodelet
@@ -17,6 +23,7 @@ find_package(
         OpenCV REQUIRED
 )
 
+
 generate_dynamic_reconfigure_options(
         cfg/camera.cfg
 )
@@ -30,8 +37,8 @@ catkin_package(
 include_directories(
         ${catkin_INCLUDE_DIRS}
         ${OpenCV_INCLUDE_DIRS}
-        include/
-        ./
+        include
+        ../hk_camera
 )
 
 
@@ -40,9 +47,17 @@ add_library(hk_camera
         src/hk_camera_node.cpp
 )
 
+# 运行时通过 RPATH 定位海康 MVS 动态库(/opt/MVS/lib/64)，避免依赖全局
+# LD_LIBRARY_PATH，防止 /opt/MVS/lib/64/libusb-1.0.so.0(旧版) 抢占系统 libusb
+# 导致 libpcl_io 报 undefined symbol: libusb_set_option
+set_target_properties(hk_camera PROPERTIES
+        BUILD_RPATH "/opt/MVS/lib/64"
+        INSTALL_RPATH "/opt/MVS/lib/64"
+        BUILD_WITH_INSTALL_RPATH FALSE
+)
 
 target_link_libraries(hk_camera
-        libMvCameraControl.so ${catkin_LIBRARIES} ${Opencv_LIBS})
+        ${MVS_LIBRARY} ${catkin_LIBRARIES} ${OpenCV_LIBS})
 
 add_dependencies(hk_camera ${PROJECT_NAME}_gencfg)
 
@@ -50,4 +65,4 @@ add_dependencies(hk_camera ${PROJECT_NAME}_gencfg)
 #        src/hk_camera_node.cpp)
 #add_dependencies(hk_camera_node ${PROJECT_NAME}_gencfg)
 #target_link_libraries(hk_camera_node
-#        libMvCameraControl.so ${catkin_LIBRARIES} ${Opencv_LIBS})
+#        ${MVS_LIBRARY} ${catkin_LIBRARIES} ${OpenCV_LIBS})

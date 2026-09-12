@@ -5,22 +5,31 @@
 #ifndef SRC_HK_CAMERA_INCLUDE_GALAXY_CAMERA_H_
 #define SRC_HK_CAMERA_INCLUDE_GALAXY_CAMERA_H_
 #include <nodelet/nodelet.h>
+#include <algorithm>
 #include <image_transport/image_transport.h>
 #include <dynamic_reconfigure/server.h>
 #include <hk_camera/CameraConfig.h>
 #include <camera_info_manager/camera_info_manager.h>
-#include <dynamic_reconfigure/client.h>
+#include <ros/time.h>
 #include <sensor_msgs/TimeReference.h>
-#include <rm_msgs/CameraStatus.h>
 #include <string>
-#include <thread>
-#include <chrono>
+#include <mutex>
 #include "libMVSapi/MvCameraControl.h"
 #include <rm_msgs/EnableImuTrigger.h>
-#include <termios.h>
 #include <std_msgs/String.h>
 #include <rm_msgs/StatusChange.h>
 #include <std_msgs/Bool.h>
+
+// MVS SDK error checking macro
+#define CHECK_MVS(func) \
+  do { \
+    int _ret = (func); \
+    if (_ret != MV_OK) { \
+      ROS_ERROR("%s FAILED at :%d! Error code: 0x%08x", \
+                #func, __LINE__, _ret); \
+      throw std::runtime_error(#func); \
+    } \
+  } while(0)
 
 namespace hk_camera
 {
@@ -40,10 +49,6 @@ public:
   static sensor_msgs::Image image_rect;
   void timerCallback(const ros::TimerEvent&);
 
-
-  void FpsDown();
-  void imageCallback(const sensor_msgs::ImageConstPtr& msg);
-
 private:
   void reconfigCB(CameraConfig& config, uint32_t level);
   void triggerCB(const sensor_msgs::TimeReference::ConstPtr& time_ref);
@@ -52,6 +57,7 @@ private:
   void cameraStop(const std_msgs::Bool);
   void initializeCamera();
   bool changeStatusCB(rm_msgs::StatusChange::Request& change, rm_msgs::StatusChange::Response& res);
+
   ros::ServiceServer status_change_srv_;
 
   ros::NodeHandle nh_;
@@ -66,6 +72,7 @@ private:
   std::string camera_info_url_, pixel_format_, frame_id_, camera_sn_;
   double frame_rate_;
   int image_width_{}, image_height_{}, image_offset_x_{}, image_offset_y_{}, sleep_time_{};
+  bool is_sn_init{};
   double gain_value_{};
   int gamma_selector_{};
   double gamma_value_{};
@@ -105,14 +112,11 @@ private:
   ros::Subscriber camera_change_sub;
   ros::Subscriber camera_stop_sub_;
 
-  ros::NodeHandle d_nh_;
-  image_transport::ImageTransport d_it_;
   image_transport::Publisher d_pub_;
-  image_transport::Subscriber d_sub_;
-  std::string camera_raw_;
-  double target_fps_;
-  ros::Time last_pub_time_;
-  bool is_fps_down_;
+  double target_fps_{40.0};
+  ros::WallTime next_pub_time_;
+  bool is_fps_down_{};
+  std::mutex fps_down_mutex_;
 
   std::string node_name_;
 };
