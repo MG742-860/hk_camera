@@ -4,13 +4,9 @@ ROS wrapper for the hk camera made by Hikrobot.
 # Install dependencies
 Dependencies:
 - ROS Noetic
-- libMvCameraControl.so  download `MVS_STD_GML_V2.1.1_220511` from
-https://www.hikrobotics.com/cn/machinevision/service/download?module=0 and install,
-then extract `MVS-2.1.1_x86_64_20220511.tar.gz` and decompress it.
-- In the catalogue of which you decompressed, run `sudo ./setup.sh`.
-  - 24年的驱动用`sudo bash setup.sh`
-- Then run `sudo cp /opt/MVS/lib/64/libMvCameraControl.so /usr/lib`.
-Turn
+- libMvCameraControl.so  download `MVS_STD_GML_V**` from
+[here](https://www.hikrobotics.com/cn/machinevision/service/download?module=0)
+>download the lastest, or the same version in the robots
 # 跑hk没有compressed话题
 
 ```shell
@@ -66,3 +62,24 @@ scp xxxx.yaml dynamicx@192.168.100.2:/home/dynamicx/.ros/camera_info/
 More information:
 
 - http://wiki.ros.org/image_pipeline
+
+# Other Warnings
+## 1. 相机强制使用libMvCameraControl.so
+在编译的时候，必须指定libMvCameraControl.so的路径，否则会报错找不到libMvCameraControl.so
+```shell
+# 使用cmake强制指定
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/path/to/libMvCameraControl.so ..
+# 或者像Cmakelist.txt一样，用绝对路径强制指定
+set(MVS_LIBRARY /opt/MVS/lib/64/libMvCameraControl.so)
+```
+## 2. 其他包需要用libusb.so但是报错（建议提前修复）
+首先搞清楚2个东西：
+- libusb-1.0.so.0：libusb的动态库，通常在/usr/lib/x86_64-linux-gnu/下
+- libusb.so：libusb的开发库，通常在/usr/lib/x86_64-linux-gnu/下
+
+有关以上任何的问题，提前检查你是不是链接到了/opt/MVS/lib/下的libusb，这个库过于老旧，已经弃用，只给hk_camera()使用。
+
+解决方案：
+- 强制指定libusb指向pcl的libusb
+- 删除.bashrc中对libusb的指定（每次安装MVS驱动都要弄）
+- CmakeLists.txt中使用别名（这里就是）
