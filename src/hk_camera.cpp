@@ -24,7 +24,6 @@ namespace hk_camera
         this->status_change_srv_ = nh_.advertiseService("exposure_status_switch", &HKCameraNodelet::changeStatusCB,
                                                         this);
 
-        dev_num_ = 0;
         // get param
         {
             nh_.param("camera_frame_id", image_.header.frame_id, std::string("camera_optical_frame"));
@@ -83,7 +82,7 @@ namespace hk_camera
         ROS_INFO("OnINit initializeCamera");
 
         ros::Time start = ros::Time::now();
-        while (!initializeCamera())
+        while (!initializeCamera() && ros::ok())
         {
             ros::Duration(1).sleep();
             if ((ros::Time::now() - start).toSec() > 10 || !ros::ok())
@@ -94,6 +93,11 @@ namespace hk_camera
             }
         }
 
+        camera_change_sub = nh_.subscribe("/camera_name", 50, &hk_camera::HKCameraNodelet::cameraChange, this);
+        camera_stop_sub_ = nh_.subscribe("/camera_stop", 50, &hk_camera::HKCameraNodelet::cameraStop, this);
+
+        timer_ = nh_.createTimer(ros::Duration(1), &HKCameraNodelet::timerCallback, this);
+
         ros::NodeHandle p_nh(nh_, "hk_camera_reconfig");
         pub_rect_ = p_nh.advertise<sensor_msgs::Image>("/image_rect", 1);
         srv_ = new dynamic_reconfigure::Server<CameraConfig>(p_nh);
@@ -101,10 +105,6 @@ namespace hk_camera
             &HKCameraNodelet::reconfigCB, this, _1, _2);
         srv_->setCallback(cb);
 
-        camera_change_sub = nh_.subscribe("/camera_name", 50, &hk_camera::HKCameraNodelet::cameraChange, this);
-        camera_stop_sub_ = nh_.subscribe("/camera_stop", 50, &hk_camera::HKCameraNodelet::cameraStop, this);
-
-        timer_ = nh_.createTimer(ros::Duration(1), &HKCameraNodelet::timerCallback, this);
         ROS_INFO("Camera %s is ready", camera_name_.c_str());
     }
 
@@ -113,103 +113,94 @@ namespace hk_camera
         ROS_WARN("start initializeCamera");
         MV_CC_DEVICE_INFO_LIST stDeviceList;
         memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
-        try
+        int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+        if (nRet != MV_OK)
         {
-            int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
-            if (nRet != MV_OK)
-                throw(nRet);
-        }
-        catch (int nRet)
-        {
-            std::cout << "MV_CC_EnumDevices fail! nRet " << std::hex << nRet << std::endl;
+            ROS_ERROR("initializeCamera() failed: MV_CC_EnumDevices failed:0x%08x", nRet);
             return false;
         }
+
         //  assert(MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList) == MV_OK);
-        try
+        if (stDeviceList.nDeviceNum <= 0)
         {
-            if (stDeviceList.nDeviceNum <= 0)
-            {
-                throw std::runtime_error("stDeviceList.nDeviceNum <= 0");
-            }
-        }
-        catch (std::runtime_error& e)
-        {
-            ROS_ERROR("%s", e.what());
+            ROS_ERROR("initializaCamera() failed:stDeviceList.nDeviceNum <= 0,"
+                "check physical connection or wait all camera ready.");
+            // throw std::runtime_error("No camera found");
             return false;
         }
 
         // Opens the device.
-        unsigned int nIndex = 0;
         MVCC_STRINGVALUE dev_sn;
         memset(&dev_sn, 0, sizeof(MVCC_STRINGVALUE));
         ros::Duration(sleep_time_).sleep();
-        if (stDeviceList.nDeviceNum > 1)
-        {
-            if (camera_sn_.empty())
+
+        // 老辈子的代码就不能实现一个manager连接多个相机，launch文件也是开两个vision_nodelet
+        // if (stDeviceList.nDeviceNum > 1)
+        // {
+        //     if (camera_sn_.empty())
+        //     {
+        //         ROS_ERROR("Multiple cameras found, but camera_sn is empty.");
+        //         // throw std::runtime_error("camera_sn is required when multiple cameras are connected");
+        //         return false;
+        //     }
+        //     for (int not_matched_num = 0; nIndex < stDeviceList.nDeviceNum; nIndex++)
+        //     {
+        //         ROS_WARN("initializeCamera():creating handle");
+        //         try{
+        //             CHECK_MVS(MV_CC_CreateHandle(&dev_handle_, stDeviceList.pDeviceInfo[nIndex]));
+        //             CHECK_MVS(MV_CC_OpenDevice(dev_handle_));
+        //             CHECK_MVS(MV_CC_GetStringValue(dev_handle_, "DeviceSerialNumber", &dev_sn));
+        //         }catch (std::runtime_error& e)
+        //         {
+        //             ROS_ERROR("initializeCamera():initialize handle failed:%s", e.what());
+        //             releaseDevice();
+        //             return false;
+        //         }
+        //         if (strcmp(dev_sn.chCurValue, (char*)camera_sn_.data()) == 0)
+        //         {
+        //             ROS_WARN("initializeCamera():find target!");
+        //             dev_num_++;
+        //             break;
+        //         }
+        //         releaseDevice();
+        //         ROS_WARN("initializeCamera():wrong target %d",nIndex);
+        //         not_matched_num++;
+        //         //If all device not match, drop.
+        //         if (not_matched_num == stDeviceList.nDeviceNum)
+        //         {
+        //             ROS_ERROR("initializeCamera():all Serial number not match!");
+        //             // throw std::runtime_error("Serial number not match!");
+        //             return false;
+        //         }
+        //     }
+        // }
+        // else
+
+        // 改成：识别单个且SN码正确的相机
+        try{
+            for (int i = 0; i < stDeviceList.nDeviceNum; i++)
             {
-                ROS_ERROR("Multiple cameras found, but camera_sn is empty.");
-                // throw std::runtime_error("camera_sn is required when multiple cameras are connected");
-                return false;
-            }
-            for (int not_matched_num = 0; nIndex < stDeviceList.nDeviceNum; nIndex++)
-            {
-                ROS_WARN("creating handle");
-                try{
-                    CHECK_MVS(MV_CC_CreateHandle(&dev_handle_, stDeviceList.pDeviceInfo[nIndex]));
-                    CHECK_MVS(MV_CC_OpenDevice(dev_handle_));
-                    CHECK_MVS(MV_CC_GetStringValue(dev_handle_, "DeviceSerialNumber", &dev_sn));
-                }catch (std::runtime_error& e)
-                {
-                    ROS_ERROR("initialize handle failed:%s", e.what());
-                    releaseDevice();
-                    return false;
-                }
+                if (stDeviceList.nDeviceNum == 1) break;
+                CHECK_MVS(MV_CC_CreateHandle(&dev_handle_, stDeviceList.pDeviceInfo[i]));
+                CHECK_MVS(MV_CC_OpenDevice(dev_handle_));
+                MV_CC_GetStringValue(dev_handle_, "DeviceSerialNumber", &dev_sn);
                 if (strcmp(dev_sn.chCurValue, (char*)camera_sn_.data()) == 0)
                 {
-                    ROS_WARN("find target!");
-                    dev_num_++;
+                    ROS_INFO("initializeCamera():find target %s!",camera_sn_.c_str());
                     break;
                 }
-                else
-                {
-                    releaseDevice();
-                    ROS_WARN("wrong target");
-                    not_matched_num++;
-                    //If all device not match, drop.
-                    if (not_matched_num == stDeviceList.nDeviceNum)
-                    {
-                        ROS_ERROR("Serial number not match!");
-                        // throw std::runtime_error("Serial number not match!");
-                        releaseDevice();
-                        return false;
-                    }
-                }
+                ROS_WARN("initializeCamera():wrong target %s!",dev_sn.chCurValue);
+                MV_CC_DestroyHandle(dev_handle_);
+                dev_handle_ = nullptr;
             }
-        }
-        else
+        }catch (std::exception& e)
         {
-            try{
-                CHECK_MVS(MV_CC_CreateHandle(&dev_handle_, stDeviceList.pDeviceInfo[nIndex]));
-                CHECK_MVS(MV_CC_OpenDevice(dev_handle_));
-                CHECK_MVS(MV_CC_GetStringValue(dev_handle_, "DeviceSerialNumber", &dev_sn));
-            }catch (std::runtime_error& e)
-            {
-                ROS_ERROR("initialize failed: %s", e.what());
-                releaseDevice();
-                return false;
-            }
-            if (dev_sn.chCurValue[0] == '\0' && stDeviceList.nDeviceNum > 1)
-            {
-                ROS_ERROR("Device serial number is null.");
-                // throw std::runtime_error("Device serial number is null");
-                releaseDevice();
-                return false;
-            }
-            dev_num_ = 1;
-            //If first init and only one device, use device_sn instead of camera_sn in the config.yaml
-            if (!is_sn_init)
-                camera_sn_ = std::string(dev_sn.chCurValue);
+            ROS_ERROR("initialCamera() exception:%s", e.what());
         }
+
+        //If first init and only one device, use device_sn instead of camera_sn in the config.yaml
+        if (!is_sn_init) camera_sn_ = std::string(dev_sn.chCurValue);
+
         //Camera_sn first init complete, won't change camera_sn_ anymore
         is_sn_init = true;
 
@@ -222,13 +213,18 @@ namespace hk_camera
         // }
 
         // Print the camera serial number
-        ROS_INFO("Camera Serial Number: %s", dev_sn.chCurValue);
+        if (strcmp(dev_sn.chCurValue, (char*)camera_sn_.c_str()) != 0)
+        {
+            ROS_WARN("Camera serial number mismatch! Expected: %s, Found: %s", camera_sn_.c_str(), dev_sn.chCurValue);
+        }
+        ROS_INFO("Camera SN now use:%s",dev_sn.chCurValue);
+        // ROS_INFO("Camera Serial Number: %s", dev_sn.chCurValue);
 
 
         // Retrieve and print the camera's model name using DeviceModelName
         MVCC_STRINGVALUE model_name;
         memset(&model_name, 0, sizeof(MVCC_STRINGVALUE));
-        int nRet = MV_CC_GetStringValue(dev_handle_, "DeviceModelName", &model_name);
+        nRet = MV_CC_GetStringValue(dev_handle_, "DeviceModelName", &model_name);
         if (nRet == MV_OK)
         {
             // 相机型号
@@ -257,52 +253,42 @@ namespace hk_camera
         else if (format == PixelType_Gvsp_Undefined)
         {
             // static_assert(true, "Illegal format");
-            ROS_ERROR("illegal pixel format!");
-            releaseDevice();
-            return false;
+            ROS_ERROR("illegal pixel format! use default:bgr8");
+            format = PixelType_Gvsp_BayerRG8;
         }
         ROS_INFO("Pixel Format: %s", pixel_format_.c_str());
 
 
-        try
-        {
-            // CHECK_MVS(MV_CC_SetEnumValue(dev_handle_,"PixelFormat",format)); // 每个设备都不同，不适用
-            CHECK_MVS(MV_CC_SetIntValueEx(dev_handle_, "Width", image_width_));
-            CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "Height", image_height_));
-            CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetX", image_offset_x_));
-            CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetY", image_offset_y_));
-            //  AcquisitionLineRate ,LineRate can't be set
-            //  CHECK_MVS(MV_CC_SetBoolValue(dev_handle_,"AcquisitionLineRateEnable", true));
-            //  CHECK_MVS(MV_CC_SetIntValue(dev_handle_,"AcquisitionLineRate", 10));
-        }
-        catch (std::runtime_error& e)
-        {
-            ROS_ERROR("initialize failed:%s", e.what());
-            releaseDevice();
-            return false;
-        }
+        // CHECK_MVS(MV_CC_SetEnumValue(dev_handle_,"PixelFormat",format)); // 每个设备都不同，不适用
+        CHECK_MVS(MV_CC_SetIntValueEx(dev_handle_, "Width", image_width_));
+        CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "Height", image_height_));
+        CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetX", image_offset_x_));
+        CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetY", image_offset_y_));
+        //  AcquisitionLineRate ,LineRate can't be set
+        //  CHECK_MVS(MV_CC_SetBoolValue(dev_handle_,"AcquisitionLineRateEnable", true));
+        //  CHECK_MVS(MV_CC_SetIntValue(dev_handle_,"AcquisitionLineRate", 10));
 
         _MVCC_FLOATVALUE_T frame_rate{0};
         if (!MV_CC_SetFrameRate(dev_handle_, frame_rate_))
         {
-            ROS_ERROR("Failed to set targrt frame rate:%f",frame_rate_);
-        };
-        if (!MV_CC_GetFrameRate(dev_handle_, &frame_rate))
-        {
-            ROS_ERROR("Failed to get frame rate!");
+            ROS_WARN("Failed to set targrt frame rate:%f", frame_rate_);
         }
+
+
+        CHECK_MVS(MV_CC_GetFrameRate(dev_handle_, &frame_rate));
+
         ROS_INFO("Frame rate is: %f", frame_rate.fCurValue);
 
         CHECK_MVS(MV_CC_SetEnumValue(dev_handle_, "TriggerMode", 0));
         CHECK_MVS(MV_CC_RegisterImageCallBackEx(dev_handle_, onFrameCB, this));
-        int nRet_temp=MV_CC_StartGrabbing(dev_handle_);
-        if (nRet_temp == MV_OK)
+        nRet = MV_CC_StartGrabbing(dev_handle_);
+        if (nRet == MV_OK)
         {
             ROS_INFO("Stream On.");
         }
         else
         {
-            ROS_ERROR("Stream On failed! nRet_temp: %d", nRet_temp);
+            ROS_ERROR("Stream On failed! nRet: %d", nRet);
             releaseDevice();
             return false;
         }
@@ -311,10 +297,6 @@ namespace hk_camera
 
     void HKCameraNodelet::timerCallback(const ros::TimerEvent&)
     {
-        // if () {
-        //   ROS_WARN("set camera_restart_flag_ true!");
-        //   camera_restart_flag_ = true;
-        // }
         if (dev_handle_ && !MV_CC_IsDeviceConnected(dev_handle_))
         {
             MV_CC_DEVICE_INFO_LIST stDeviceList;
@@ -332,7 +314,7 @@ namespace hk_camera
                 return;
             }
 
-            std::cout << "searching target:" << camera_sn_ << std::endl;
+            std::cout << "timerCallback():searching target:" << camera_sn_ << std::endl;
             for (unsigned int i = 0; i < stDeviceList.nDeviceNum; i++)
             {
                 ROS_INFO("device:%d\n", stDeviceList.nDeviceNum);
@@ -357,6 +339,7 @@ namespace hk_camera
         }
         else if (dev_handle_ == nullptr && first_init_ == false)
         {
+            first_init_ = true;
             initializeCamera();
         }
     }
@@ -367,12 +350,16 @@ namespace hk_camera
             nh_.param("exposure_value_windmill", exposure_value_, 3000.0);
         else
             nh_.param("exposure_value", exposure_value_, 20.0);
-        try{
+        try
+        {
             CHECK_MVS(MV_CC_SetEnumValue(dev_handle_, "ExposureAuto", MV_EXPOSURE_AUTO_MODE_OFF));
             CHECK_MVS(MV_CC_SetFloatValue(dev_handle_, "ExposureTime", exposure_value_));
-        }catch (std::runtime_error& e)
+        }
+        catch (std::exception& e)
         {
             ROS_ERROR("changeStatusCB() error :%s", e.what());
+            res.switch_is_success = false;
+            return false;
         }
         res.switch_is_success = true;
         return true;
@@ -380,12 +367,14 @@ namespace hk_camera
 
     void HKCameraNodelet::cameraChange(const std_msgs::String& camera_change)
     {
-        try{
+        try
+        {
             if (strcmp(camera_change.data.c_str(), node_name_.substr(1).c_str()) == 0)
                 CHECK_MVS(MV_CC_StartGrabbing(dev_handle_));
             else
                 CHECK_MVS(MV_CC_StopGrabbing(dev_handle_));
-        }catch (std::runtime_error& e)
+        }
+        catch (std::exception& e)
         {
             ROS_ERROR("cameraChange() error: %s", e.what());
         }
@@ -393,12 +382,14 @@ namespace hk_camera
 
     void HKCameraNodelet::cameraStop(const std_msgs::Bool camera_stop_msg_)
     {
-        try{
+        try
+        {                                        // 停止后相机
             if (camera_stop_msg_.data == true && strcmp("camera_back", node_name_.substr(1).c_str()) == 0)
                 CHECK_MVS(MV_CC_StopGrabbing(dev_handle_));
             else
                 CHECK_MVS(MV_CC_StartGrabbing(dev_handle_));
-        }catch (std::runtime_error& e)
+        }
+        catch (std::exception& e)
         {
             ROS_ERROR("cameraStop() error: %s", e.what());
         }
@@ -410,9 +401,6 @@ namespace hk_camera
         auto* self = static_cast<HKCameraNodelet*>(pUser);
         if (pFrameInfo)
         {
-            ros::Time now = ros::Time::now();
-
-
             ros::Time now_stamp = ros::Time::now();
             image_.header.stamp = now_stamp;
             info_.header.stamp = now_stamp;
@@ -430,9 +418,9 @@ namespace hk_camera
             stConvertParam.pDstBuffer = img_;
             stConvertParam.nDstBufferSize = pFrameInfo->nWidth * pFrameInfo->nHeight * 3;
             int n_Ret_temp = MV_CC_ConvertPixelType(dev_handle_, &stConvertParam);
-            if ( n_Ret_temp != MV_OK)
+            if (n_Ret_temp != MV_OK)
             {
-                ROS_ERROR("MV_CC_ConvertPixelType() : return != MV_OK, code: %d", n_Ret_temp);
+                ROS_ERROR("MV_CC_ConvertPixelType():code: %d", n_Ret_temp);
                 return;
             }
             memcpy((char*)(&image_.data[0]), img_, image_.step * image_.height);
@@ -460,7 +448,7 @@ namespace hk_camera
 
                 try
                 {
-                    cv::resize(cv_img, cv_img, cvSize(resolution_ratio_width_, resolution_ratio_height_));
+                    cv::resize(cv_img, cv_img, cv::Size(resolution_ratio_width_, resolution_ratio_height_));
                 }
                 catch (cv::Exception& e)
                 {
@@ -508,7 +496,7 @@ namespace hk_camera
                 self->d_pub_.publish(image_);
         }
         else
-            ROS_ERROR("Grab image failed!");
+            ROS_ERROR("onFrameCB(): Grab image failed!");
     }
 
     void HKCameraNodelet::reconfigCB(CameraConfig& config, uint32_t level)
@@ -533,7 +521,9 @@ namespace hk_camera
             initialize_flag_ = false;
         }
 
-        try{
+        try
+        {
+            if (dev_handle_ == nullptr) return;
             // Switch camera
             if (!config.stop_grab)
                 CHECK_MVS(MV_CC_StartGrabbing(dev_handle_));
@@ -622,8 +612,7 @@ namespace hk_camera
                 break;
             case 2:
                 {
-                    //      CHECK_MVS(MV_CC_SetBoolValue(dev_handle_, "GammaEnable", false));
-                    CHECK_MVS(MV_CC_SetBoolValue(dev_handle_, "GammaEnable", false));
+                    // CHECK_MVS(MV_CC_SetBoolValue(dev_handle_, "GammaEnable", false));
                     CHECK_MVS(MV_CC_SetBoolValue(dev_handle_, "GammaEnable", false));
                     break;
                 }
@@ -631,9 +620,10 @@ namespace hk_camera
                 ROS_ERROR("Invalid gamma_selector value: %d", config.gamma_selector);
                 break;
             }
-        }catch (std::runtime_error& e)
+        }
+        catch (std::exception& e)
         {
-            ROS_ERROR("Error in reconfigCB: %s", e.what());
+            ROS_ERROR("reconfigCB(): %s", e.what());
         }
 
         // take_photo_ = config.take_photo;
@@ -647,7 +637,10 @@ namespace hk_camera
 
     HKCameraNodelet::~HKCameraNodelet()
     {
-        timer_.stop();
+        if (timer_.isValid()) timer_.stop();
+        camera_change_sub.shutdown();
+        camera_stop_sub_.shutdown();
+        status_change_srv_.shutdown();
         releaseDevice();
         delete[] img_;
         img_ = nullptr;
@@ -659,15 +652,17 @@ namespace hk_camera
     {
         if (dev_handle_)
         {
-            try{
+            try
+            {
                 CHECK_MVS(MV_CC_StopGrabbing(dev_handle_));
                 CHECK_MVS(MV_CC_RegisterImageCallBackEx(dev_handle_, nullptr, nullptr));
                 CHECK_MVS(MV_CC_CloseDevice(dev_handle_));
                 CHECK_MVS(MV_CC_DestroyHandle(dev_handle_));
                 dev_handle_ = nullptr;
-            }catch (std::runtime_error& e)
+            }
+            catch (std::exception& e)
             {
-                ROS_ERROR("Error in releaseDevice: %s", e.what());
+                ROS_ERROR("releaseDevice(): %s", e.what());
             }
         }
     }

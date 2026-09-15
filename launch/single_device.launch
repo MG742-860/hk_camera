@@ -14,6 +14,11 @@
         <param name="camera_sn" value="DA5510091"/>
         <param name="frame_rate" value="200"/>
         <param name="enable_imu_trigger" value="$(arg enable_imu_trigger)"/>
+        <param name="gain_value" value="14"/>
+        <param name="gain_auto" value="false"/>
+        <param name="exposure_value" value="2000"/>
+        <param name="gamma_selector" value="2"/>
+        <param name="gamma_value" value="0.7"/>
         <param name="enable_resolution" value="true"/>
         <param name="resolution_ratio_width" value="1440"/>
         <param name="resolution_ratio_height" value="1080"/>

@@ -24,7 +24,6 @@
         if (_ret != MV_OK) { \
         ROS_ERROR("%s FAILED at :%d! Error code: 0x%08x", \
             #func, __LINE__, _ret); \
-        throw std::runtime_error(#func); \
         } \
     } while(0)
 
@@ -52,7 +51,6 @@ namespace hk_camera
 
         ros::NodeHandle nh_;
         static void* dev_handle_;
-        int dev_num_;
         // bool camera_restart_flag_;
         dynamic_reconfigure::Server<CameraConfig>* srv_{};
 
