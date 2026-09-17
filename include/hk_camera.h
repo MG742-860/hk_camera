@@ -18,13 +18,13 @@
 #include <std_msgs/Bool.h>
 
 // MVS SDK error checking macro
-#define CHECK_MVS(func) \
-    do { \
-        int _ret = (func); \
-        if (_ret != MV_OK) { \
-        ROS_ERROR("%s FAILED at :%d! Error code: 0x%08x", \
-            #func, __LINE__, _ret); \
-        } \
+#define CHECK_MVS(func)                                         \
+    do {                                                        \
+        int _ret = (func);                                      \
+        if (_ret != MV_OK) {                                    \
+        ROS_ERROR("%s: %s FAILED at :%d! Error code: 0x%08x",   \
+            __FILE__, #func, __LINE__, _ret);                   \
+        }                                                       \
     } while(0)
 
 namespace hk_camera
@@ -36,21 +36,22 @@ namespace hk_camera
         ~HKCameraNodelet() override;
 
         void onInit() override;
-        static sensor_msgs::Image image_;
+        sensor_msgs::Image image_;
         void timerCallback(const ros::TimerEvent&);
 
     private:
         void reconfigCB(CameraConfig& config, uint32_t level);
         void cameraChange(const std_msgs::String&);
         void cameraStop(const std_msgs::Bool);
-        bool initializeCamera();
+        bool initializeCamera(bool from_timerCB = false);
+        MvGvspPixelType getPixelFormat(const std::string& pixelformat);
         void releaseDevice();
         bool changeStatusCB(rm_msgs::StatusChange::Request& change, rm_msgs::StatusChange::Response& res);
 
         ros::ServiceServer status_change_srv_;
 
         ros::NodeHandle nh_;
-        static void* dev_handle_;
+        void* dev_handle_;
         // bool camera_restart_flag_;
         dynamic_reconfigure::Server<CameraConfig>* srv_{};
 
@@ -60,7 +61,6 @@ namespace hk_camera
         std::string camera_info_url_, pixel_format_, frame_id_, camera_sn_;
         double frame_rate_;
         int image_width_{}, image_height_{}, image_offset_x_{}, image_offset_y_{}, sleep_time_{};
-        bool is_sn_init{};
         double gain_value_{};
         int gamma_selector_{};
         double gamma_value_{};
@@ -75,17 +75,17 @@ namespace hk_camera
         int white_selector_{};
         bool stop_grab_{};
         size_t image_buffer_size_;
-        static unsigned char* img_;
-        static image_transport::CameraPublisher pub_;
-        static ros::Publisher pub_rect_;
-        static sensor_msgs::CameraInfo info_;
-        static bool enable_resolution_;
-        static int resolution_ratio_width_;
-        static int resolution_ratio_height_;
+        unsigned char* img_;
+        image_transport::CameraPublisher pub_;
+        ros::Publisher pub_rect_;
+        sensor_msgs::CameraInfo info_;
+        bool enable_resolution_;
+        int resolution_ratio_width_;
+        int resolution_ratio_height_;
         //  bool take_photo_
         static void __stdcall onFrameCB(unsigned char* pData, MV_FRAME_OUT_INFO_EX* pFrameInfo, void* pUser);
-        // void processFrame();
-        // void processOneFrame();
+        void processFrame(unsigned char* pData, MV_FRAME_OUT_INFO_EX* pFrameInfo);
+        bool ensureBufferLocked(uint32_t width, uint32_t height);
         ros::Subscriber camera_change_sub;
         ros::Subscriber camera_stop_sub_;
 

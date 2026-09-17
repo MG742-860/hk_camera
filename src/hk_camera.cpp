@@ -7,6 +7,7 @@
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <iostream>
+#include <glog/logging.h>
 
 namespace hk_camera
 {
@@ -77,6 +78,8 @@ namespace hk_camera
         image_.step = image_width_ * 3;
         image_.data.resize(image_.height * image_.step);
         image_.encoding = pixel_format_;
+        image_.is_bigendian = 0;
+        image_.header.frame_id = frame_id_;
         image_buffer_size_ = image_.height * image_.step;
         img_ = new unsigned char[image_.height * image_.step];
         ROS_INFO("OnINit initializeCamera");
@@ -108,7 +111,29 @@ namespace hk_camera
         ROS_INFO("Camera %s is ready", camera_name_.c_str());
     }
 
-    bool HKCameraNodelet::initializeCamera()
+    MvGvspPixelType HKCameraNodelet::getPixelFormat(const std::string& pixelformat)
+    {
+        if (pixel_format_ == "mono8")
+            return PixelType_Gvsp_Mono8;
+        else if (pixel_format_ == "mono16")
+            return PixelType_Gvsp_Mono16;
+            // SDK api过老，后续更新
+            // 下列对应关系目前就是这样的，不要使用Packed后缀
+        else if (pixel_format_ == "bgra8")
+            return PixelType_Gvsp_BayerBG8;
+        else if (pixel_format_ == "rgb8")
+            return PixelType_Gvsp_BayerRG8;
+        else if (pixel_format_ == "bgr8")
+            return PixelType_Gvsp_BayerGB8;
+        else
+        {
+            // static_assert(true, "Illegal format");
+            ROS_ERROR("illegal pixel format! use default:bgr8");
+            return PixelType_Gvsp_BayerRG8;
+        }
+    }
+
+    bool HKCameraNodelet::initializeCamera(const bool from_timerCB)
     {
         ROS_WARN("start initializeCamera");
         MV_CC_DEVICE_INFO_LIST stDeviceList;
@@ -129,12 +154,7 @@ namespace hk_camera
             return false;
         }
 
-        // Opens the device.
-        MVCC_STRINGVALUE dev_sn;
-        memset(&dev_sn, 0, sizeof(MVCC_STRINGVALUE));
-        ros::Duration(sleep_time_).sleep();
 
-        // 老辈子的代码就不能实现一个manager连接多个相机，launch文件也是开两个vision_nodelet
         // if (stDeviceList.nDeviceNum > 1)
         // {
         //     if (camera_sn_.empty())
@@ -177,39 +197,39 @@ namespace hk_camera
         // else
 
         // 改成：识别单个且SN码正确的相机
-        try{
-            for (int i = 0; i < stDeviceList.nDeviceNum; i++)
-            {
-                if (stDeviceList.nDeviceNum == 1) break;
-                CHECK_MVS(MV_CC_CreateHandle(&dev_handle_, stDeviceList.pDeviceInfo[i]));
-                CHECK_MVS(MV_CC_OpenDevice(dev_handle_));
-                MV_CC_GetStringValue(dev_handle_, "DeviceSerialNumber", &dev_sn);
-                if (strcmp(dev_sn.chCurValue, (char*)camera_sn_.data()) == 0)
-                {
-                    ROS_INFO("initializeCamera():find target %s!",camera_sn_.c_str());
-                    break;
-                }
-                ROS_WARN("initializeCamera():wrong target %s!",dev_sn.chCurValue);
-                MV_CC_DestroyHandle(dev_handle_);
-                dev_handle_ = nullptr;
-            }
-        }catch (std::exception& e)
+        // 让单个相机sn码不对时，使用api获取到的sn
+        // todo：支持多相机
+        // Opens the device.
+        MVCC_STRINGVALUE dev_sn;
+        memset(&dev_sn, 0, sizeof(MVCC_STRINGVALUE));
+        ros::Duration(sleep_time_).sleep();
+        for (int i = 0; i < stDeviceList.nDeviceNum; i++)
         {
-            ROS_ERROR("initialCamera() exception:%s", e.what());
+            CHECK_MVS(MV_CC_CreateHandle(&dev_handle_, stDeviceList.pDeviceInfo[i]));
+            CHECK_MVS(MV_CC_OpenDevice(dev_handle_));
+            MV_CC_GetStringValue(dev_handle_, "DeviceSerialNumber", &dev_sn);
+            if (stDeviceList.nDeviceNum == 1 && !from_timerCB) break;
+            if (strcmp(dev_sn.chCurValue, (char*)camera_sn_.data()) == 0)
+            {
+                ROS_INFO("initializeCamera():find target %s!", camera_sn_.c_str());
+                break;
+            }
+            ROS_WARN("initializeCamera():wrong target %s!", dev_sn.chCurValue);
+            CHECK_MVS(MV_CC_CloseDevice(dev_handle_));
+            CHECK_MVS(MV_CC_DestroyHandle(dev_handle_));
+            dev_handle_ = nullptr;
+            if (i == stDeviceList.nDeviceNum - 1) return false; // all dev mismacth
         }
 
         //If first init and only one device, use device_sn instead of camera_sn in the config.yaml
-        if (!is_sn_init) camera_sn_ = std::string(dev_sn.chCurValue);
-
         //Camera_sn first init complete, won't change camera_sn_ anymore
-        is_sn_init = true;
+        if (!from_timerCB) camera_sn_ = std::string(dev_sn.chCurValue);
 
         // if (!dev_sn.chCurValue)
         // {
         //   ROS_ERROR("No camera found, check physical connection.");
         //   // throw std::runtime_error("No camera found");
         //   return false;
-
         // }
 
         // Print the camera serial number
@@ -217,9 +237,9 @@ namespace hk_camera
         {
             ROS_WARN("Camera serial number mismatch! Expected: %s, Found: %s", camera_sn_.c_str(), dev_sn.chCurValue);
         }
-        ROS_INFO("Camera SN now use:%s",dev_sn.chCurValue);
+        if (from_timerCB) std::cout << "timerCallback(): ";
+        ROS_INFO("Camera SN now use:%s", dev_sn.chCurValue);
         // ROS_INFO("Camera Serial Number: %s", dev_sn.chCurValue);
-
 
         // Retrieve and print the camera's model name using DeviceModelName
         MVCC_STRINGVALUE model_name;
@@ -232,48 +252,36 @@ namespace hk_camera
         }
         else
         {
-            ROS_WARN("Failed to get camera model name. Error code: %x", nRet);
+            ROS_WARN("Failed to get camera model name. Error code: 0x%08x", nRet);
             releaseDevice();
             return false;
         }
 
-        MvGvspPixelType format = PixelType_Gvsp_Undefined;
-        if (pixel_format_ == "mono8")
-            format = PixelType_Gvsp_Mono8;
-        else if (pixel_format_ == "mono16")
-            format = PixelType_Gvsp_Mono16;
-            // SDK api过老，后续更新
-            // 下列对应关系目前就是这样的，不要使用Packed后缀
-        else if (pixel_format_ == "bgra8")
-            format = PixelType_Gvsp_BayerBG8;
-        else if (pixel_format_ == "rgb8")
-            format = PixelType_Gvsp_BayerRG8;
-        else if (pixel_format_ == "bgr8")
-            format = PixelType_Gvsp_BayerGB8;
-        else if (format == PixelType_Gvsp_Undefined)
-        {
-            // static_assert(true, "Illegal format");
-            ROS_ERROR("illegal pixel format! use default:bgr8");
-            format = PixelType_Gvsp_BayerRG8;
-        }
+        MvGvspPixelType format = getPixelFormat(pixel_format_);
+
         ROS_INFO("Pixel Format: %s", pixel_format_.c_str());
 
-
-        // CHECK_MVS(MV_CC_SetEnumValue(dev_handle_,"PixelFormat",format)); // 每个设备都不同，不适用
-        CHECK_MVS(MV_CC_SetIntValueEx(dev_handle_, "Width", image_width_));
-        CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "Height", image_height_));
-        CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetX", image_offset_x_));
-        CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetY", image_offset_y_));
-        //  AcquisitionLineRate ,LineRate can't be set
-        //  CHECK_MVS(MV_CC_SetBoolValue(dev_handle_,"AcquisitionLineRateEnable", true));
-        //  CHECK_MVS(MV_CC_SetIntValue(dev_handle_,"AcquisitionLineRate", 10));
+        try
+        {
+            CHECK_MVS(MV_CC_SetEnumValue(dev_handle_,"PixelFormat",format)); // 每个设备都不同，不建议
+            CHECK_MVS(MV_CC_SetIntValueEx(dev_handle_, "Width", image_width_));
+            CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "Height", image_height_));
+            CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetX", image_offset_x_));
+            CHECK_MVS(MV_CC_SetIntValue(dev_handle_, "OffsetY", image_offset_y_));
+            //  AcquisitionLineRate ,LineRate can't be set
+            //  CHECK_MVS(MV_CC_SetBoolValue(dev_handle_,"AcquisitionLineRateEnable", true));
+            //  CHECK_MVS(MV_CC_SetIntValue(dev_handle_,"AcquisitionLineRate", 10));
+        }
+        catch (std::exception& e)
+        {
+            ROS_ERROR("initializeCamera() error occurred： %s", e.what());
+        }
 
         _MVCC_FLOATVALUE_T frame_rate{0};
-        if (!MV_CC_SetFrameRate(dev_handle_, frame_rate_))
+        if (MV_CC_SetFrameRate(dev_handle_, static_cast<float>(frame_rate_)) != MV_OK)
         {
             ROS_WARN("Failed to set targrt frame rate:%f", frame_rate_);
         }
-
 
         CHECK_MVS(MV_CC_GetFrameRate(dev_handle_, &frame_rate));
 
@@ -292,55 +300,60 @@ namespace hk_camera
             releaseDevice();
             return false;
         }
+        first_init_ = true;
         return true;
     }
 
     void HKCameraNodelet::timerCallback(const ros::TimerEvent&)
     {
-        if (dev_handle_ && !MV_CC_IsDeviceConnected(dev_handle_))
+        if (dev_handle_ != nullptr && !MV_CC_IsDeviceConnected(dev_handle_))
         {
-            MV_CC_DEVICE_INFO_LIST stDeviceList;
-            memset(&stDeviceList, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
-            try
-            {
-                int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
-                if (nRet != MV_OK)
-                    throw(nRet);
-            }
-            catch (int nRet)
-            {
-                std::cout << "MV_CC_EnumDevices fail! nRet " << std::hex << nRet << std::endl;
-                // exit(-1);
-                return;
-            }
-
-            std::cout << "timerCallback():searching target:" << camera_sn_ << std::endl;
-            for (unsigned int i = 0; i < stDeviceList.nDeviceNum; i++)
-            {
-                ROS_INFO("device:%d\n", stDeviceList.nDeviceNum);
-                if (stDeviceList.pDeviceInfo[i] == nullptr)
-                {
-                    ROS_INFO("no device.");
-                    break;
-                }
-                const char* sn = reinterpret_cast<const char*>(
-                    stDeviceList.pDeviceInfo[i]->SpecialInfo.stUsb3VInfo.chSerialNumber);
-
-                // if device_sn and camera_sn_ not the same, reject
-                if (strcmp(sn, camera_sn_.c_str()) == 0)
-                {
-                    releaseDevice();
-                    dev_handle_ = nullptr;
-                    initializeCamera();
-                    // camera_restart_flag_ = false;
-                    break;
-                }
-            }
+            ROS_INFO("timerCallback():Searching target: %s", camera_sn_.c_str());
+            releaseDevice(); // 先释放旧handle
+            initializeCamera(true); // 这样initial时会强制配对之前的相机(通过SN)
+            // try
+            // {
+            //     int nRet = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &stDeviceList);
+            //     if (nRet != MV_OK)
+            //         throw(nRet);
+            // }
+            // catch (int nRet)
+            // {
+            //     std::cout << "MV_CC_EnumDevices fail! nRet " << std::hex << nRet << std::endl;
+            //     // exit(-1);
+            //     return;
+            // }
+            //
+            // std::cout << "timerCallback():searching target:" << camera_sn_ << std::endl;
+            // for (unsigned int i = 0; i < stDeviceList.nDeviceNum; i++)
+            // {
+            //     ROS_INFO("device:%d\n", stDeviceList.nDeviceNum);
+            //     if (stDeviceList.pDeviceInfo[i] == nullptr)
+            //     {
+            //         ROS_INFO("no device.");
+            //         break;
+            //     }
+            //     const char* sn = reinterpret_cast<const char*>(
+            //         stDeviceList.pDeviceInfo[i]->SpecialInfo.stUsb3VInfo.chSerialNumber);
+            //
+            //     // if device_sn and camera_sn_ not the same, reject
+            //     if (strcmp(sn, camera_sn_.c_str()) == 0)
+            //     {
+            //         releaseDevice();
+            //         dev_handle_ = nullptr;
+            //         initializeCamera();
+            //         // camera_restart_flag_ = false;
+            //         break;
+            //     }
+            // }
         }
         else if (dev_handle_ == nullptr && first_init_ == false)
         {
-            first_init_ = true;
-            initializeCamera();
+            initializeCamera(false);
+        }
+        else
+        {
+            ROS_WARN("something error,or you can check camera dev_handle_/physical connect.");
         }
     }
 
@@ -383,10 +396,11 @@ namespace hk_camera
     void HKCameraNodelet::cameraStop(const std_msgs::Bool camera_stop_msg_)
     {
         try
-        {                                        // 停止后相机
+        {
+            // 停止后相机
             if (camera_stop_msg_.data == true && strcmp("camera_back", node_name_.substr(1).c_str()) == 0)
                 CHECK_MVS(MV_CC_StopGrabbing(dev_handle_));
-            else
+            if (camera_stop_msg_.data != true && strcmp("camera_back", node_name_.substr(1).c_str()) == 0)
                 CHECK_MVS(MV_CC_StartGrabbing(dev_handle_));
         }
         catch (std::exception& e)
@@ -398,105 +412,215 @@ namespace hk_camera
 
     void HKCameraNodelet::onFrameCB(unsigned char* pData, MV_FRAME_OUT_INFO_EX* pFrameInfo, void* pUser)
     {
-        auto* self = static_cast<HKCameraNodelet*>(pUser);
-        if (pFrameInfo)
+        try
         {
-            ros::Time now_stamp = ros::Time::now();
-            image_.header.stamp = now_stamp;
-            info_.header.stamp = now_stamp;
-
-
-            MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
-            // Top to bottom are：image width, image height, input data buffer, input data size, source pixel format,
-            // destination pixel format, output data buffer, provided output buffer size
-            stConvertParam.nWidth = pFrameInfo->nWidth;
-            stConvertParam.nHeight = pFrameInfo->nHeight;
-            stConvertParam.pSrcData = pData;
-            stConvertParam.nSrcDataLen = pFrameInfo->nFrameLen;
-            stConvertParam.enSrcPixelType = pFrameInfo->enPixelType;
-            stConvertParam.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
-            stConvertParam.pDstBuffer = img_;
-            stConvertParam.nDstBufferSize = pFrameInfo->nWidth * pFrameInfo->nHeight * 3;
-            int n_Ret_temp = MV_CC_ConvertPixelType(dev_handle_, &stConvertParam);
-            if (n_Ret_temp != MV_OK)
-            {
-                ROS_ERROR("MV_CC_ConvertPixelType():code: %d", n_Ret_temp);
-                return;
-            }
-            memcpy((char*)(&image_.data[0]), img_, image_.step * image_.height);
-
-            //      if(take_photo_)
-            //      {
-            //          std::string str;
-            //          str = std::to_string(count_);
-            //          ROS_INFO("ok");
-            //          cv_bridge::CvImagePtr cv_ptr1;
-            //          cv_ptr1 = cv_bridge::toCvCopy(image_, "bgr8");
-            //          cv::Mat cv_img1;
-            //          cv_ptr1->image.copyTo(cv_img1);
-            //          cv::imwrite("/home/irving/carphoto/"+str+".jpg",cv_img1);
-            //          count_++;
-            //      }
-
-            if (enable_resolution_)
-            {
-                cv_bridge::CvImagePtr cv_ptr;
-                cv_ptr = cv_bridge::toCvCopy(image_, "bgr8");
-                cv::Mat cv_img;
-                cv_ptr->image.copyTo(cv_img);
-                sensor_msgs::ImagePtr image_rect_ptr;
-
-                try
-                {
-                    cv::resize(cv_img, cv_img, cv::Size(resolution_ratio_width_, resolution_ratio_height_));
-                }
-                catch (cv::Exception& e)
-                {
-                    ROS_ERROR("onFrameCB() cv::resize failed: %s", e.what());
-                }
-                image_rect_ptr = cv_bridge::CvImage(std_msgs::Header(), "bgr8", cv_img).toImageMsg();
-                pub_rect_.publish(image_rect_ptr);
-
-                //    if (strcmp(camera_name_.data(), "hk_right"))
-                //    {
-                //      cv::Rect rect(0, 0, 1440 - width_, 1080);
-                //      cv_img = cv_img(rect);
-                //      image_rect_ptr = cv_bridge::CvImage(std_msgs::Header(), "bgr8", cv_img).toImageMsg();
-                //      pub_rect_.publish(image_rect_ptr);
-                //    }
-                //    if (strcmp(camera_name_.data(), "hk_left"))
-                //    {
-                //      cv::Rect rect(width_, 0, 1440 - width_, 1080);
-                //      cv_img = cv_img(rect);
-                //      image_rect_ptr = cv_bridge::CvImage(std_msgs::Header(), "bgr8", cv_img).toImageMsg();
-                //      pub_rect_.publish(image_rect_ptr);
-                //    }
-            }
-            pub_.publish(image_, info_);
-
-            bool publish_downsampled = false;
-            if (self->is_fps_down_)
-            {
-                const ros::WallTime current_time = ros::WallTime::now();
-                const ros::WallDuration interval(1.0 / self->target_fps_);
-                {
-                    std::lock_guard<std::mutex> lock(self->fps_down_mutex_);
-                    if (self->next_pub_time_.isZero())
-                        self->next_pub_time_ = current_time;
-                    if (current_time >= self->next_pub_time_)
-                    {
-                        do
-                            self->next_pub_time_ += interval;
-                        while (self->next_pub_time_ <= current_time);
-                        publish_downsampled = true;
-                    }
-                }
-            }
-            if (publish_downsampled)
-                self->d_pub_.publish(image_);
+            auto* self = static_cast<HKCameraNodelet*>(pUser);
+            if (self != nullptr)
+                self->processFrame(pData, pFrameInfo);
         }
-        else
-            ROS_ERROR("onFrameCB(): Grab image failed!");
+        catch (const std::exception& e)
+        {
+            ROS_ERROR("onFrameCB(): exception in onFrameCB: %s", e.what());
+        }
+        catch (...)
+        {
+            ROS_ERROR("onFrameCB(): unknown exception in onFrameCB.");
+        }
+        // 老版本的一体代码
+        {
+            // auto* self = static_cast<HKCameraNodelet*>(pUser);
+            // if (pFrameInfo)
+            // {
+            //     ros::Time now_stamp = ros::Time::now();
+            //     image_.header.stamp = now_stamp;
+            //     info_.header.stamp = now_stamp;
+            //
+            //     MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
+            //     // Top to bottom are：image width, image height, input data buffer, input data size, source pixel format,
+            //     // destination pixel format, output data buffer, provided output buffer size
+            //     stConvertParam.nWidth = pFrameInfo->nWidth;
+            //     stConvertParam.nHeight = pFrameInfo->nHeight;
+            //     stConvertParam.pSrcData = pData;
+            //     stConvertParam.nSrcDataLen = pFrameInfo->nFrameLen;
+            //     stConvertParam.enSrcPixelType = pFrameInfo->enPixelType;
+            //     stConvertParam.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
+            //     stConvertParam.pDstBuffer = img_;
+            //     stConvertParam.nDstBufferSize = pFrameInfo->nWidth * pFrameInfo->nHeight * 3;
+            //     int n_Ret_temp = MV_CC_ConvertPixelType(dev_handle_, &stConvertParam);
+            //     if (n_Ret_temp != MV_OK)
+            //     {
+            //         ROS_ERROR("MV_CC_ConvertPixelType():code: %d", n_Ret_temp);
+            //         return;
+            //     }
+            //     memcpy((char*)(&image_.data[0]), img_, image_.step * image_.height);
+            //
+            //     //      if(take_photo_)
+            //     //      {
+            //     //          std::string str;
+            //     //          str = std::to_string(count_);
+            //     //          ROS_INFO("ok");
+            //     //          cv_bridge::CvImagePtr cv_ptr1;
+            //     //          cv_ptr1 = cv_bridge::toCvCopy(image_, "bgr8");
+            //     //          cv::Mat cv_img1;
+            //     //          cv_ptr1->image.copyTo(cv_img1);
+            //     //          cv::imwrite("/home/irving/carphoto/"+str+".jpg",cv_img1);
+            //     //          count_++;
+            //     //      }
+            //
+            //     if (enable_resolution_)
+            //     {
+            //         cv_bridge::CvImagePtr cv_ptr;
+            //         cv::Mat cv_img;
+            //         try
+            //         {
+            //             cv_ptr = cv_bridge::toCvCopy(image_, "bgr8");
+            //             cv_ptr->image.copyTo(cv_img);
+            //             if (cv_img.empty()) return;
+            //             cv::resize(cv_img, cv_img, cv::Size(resolution_ratio_width_, resolution_ratio_height_));
+            //         }
+            //         catch (cv::Exception& e)
+            //         {
+            //             ROS_ERROR("onFrameCB() cv::resize failed: %s", e.what());
+            //         }
+            //         sensor_msgs::ImagePtr image_rect_ptr;
+            //         image_rect_ptr = cv_bridge::CvImage(std_msgs::Header(), "bgr8", cv_img).toImageMsg();
+            //         pub_rect_.publish(image_rect_ptr);
+            //
+            //         //    if (strcmp(camera_name_.data(), "hk_right"))
+            //         //    {
+            //         //      cv::Rect rect(0, 0, 1440 - width_, 1080);
+            //         //      cv_img = cv_img(rect);
+            //         //      image_rect_ptr = cv_bridge::CvImage(std_msgs::Header(), "bgr8", cv_img).toImageMsg();
+            //         //      pub_rect_.publish(image_rect_ptr);
+            //         //    }
+            //         //    if (strcmp(camera_name_.data(), "hk_left"))
+            //         //    {
+            //         //      cv::Rect rect(width_, 0, 1440 - width_, 1080);
+            //         //      cv_img = cv_img(rect);
+            //         //      image_rect_ptr = cv_bridge::CvImage(std_msgs::Header(), "bgr8", cv_img).toImageMsg();
+            //         //      pub_rect_.publish(image_rect_ptr);
+            //         //    }
+            //     }
+            //     pub_.publish(image_, info_);
+            //
+            //     bool publish_downsampled = false;
+            //     if (self->is_fps_down_)
+            //     {
+            //         const ros::WallTime current_time = ros::WallTime::now();
+            //         const ros::WallDuration interval(1.0 / self->target_fps_);
+            //         {
+            //             std::lock_guard<std::mutex> lock(self->fps_down_mutex_);
+            //             if (self->next_pub_time_.isZero())
+            //                 self->next_pub_time_ = current_time;
+            //             if (current_time >= self->next_pub_time_)
+            //             {
+            //                 do
+            //                     self->next_pub_time_ += interval;
+            //                 while (self->next_pub_time_ <= current_time);
+            //                 publish_downsampled = true;
+            //             }
+            //         }
+            //     }
+            //     if (publish_downsampled)
+            //         self->d_pub_.publish(image_);
+            // }
+            // else
+            //     ROS_ERROR("onFrameCB(): Grab image failed!");
+        }
+    }
+
+    void HKCameraNodelet::processFrame(unsigned char* pData, MV_FRAME_OUT_INFO_EX* pFrameInfo)
+    {
+        if (pFrameInfo == nullptr)
+        {
+            ROS_WARN("processFrame(): Garb image failed from onFramCB!");
+            return;
+        }
+        if (dev_handle_ == nullptr) return;
+        const uint32_t width = pFrameInfo->nWidth;
+        const uint32_t height = pFrameInfo->nHeight;
+        if (width == 0 || height == 0)
+        {
+            ROS_WARN("processFrame(): invalid width or height!");
+            return;
+        }
+
+        // 容量检查
+        if (!ensureBufferLocked(width, height)) return;
+
+        MV_CC_PIXEL_CONVERT_PARAM stConvertParam = {0};
+        // Top to bottom are：image width, image height, input data buffer, input data size, source pixel format,
+        // destination pixel format, output data buffer, provided output buffer size
+        stConvertParam.nWidth = pFrameInfo->nWidth;
+        stConvertParam.nHeight = pFrameInfo->nHeight;
+        stConvertParam.pSrcData = pData;
+        stConvertParam.nSrcDataLen = pFrameInfo->nFrameLen;
+        stConvertParam.enSrcPixelType = pFrameInfo->enPixelType;
+        stConvertParam.enDstPixelType = PixelType_Gvsp_BGR8_Packed;
+        stConvertParam.pDstBuffer = img_;
+        stConvertParam.nDstBufferSize = static_cast<unsigned int>(
+            std::min<uint64_t>(static_cast<uint64_t>(image_buffer_size_), 0xFFFFFFFFULL));
+
+        int nRet = MV_CC_ConvertPixelType(dev_handle_, &stConvertParam);
+        if (nRet!=MV_OK)
+        {
+            ROS_WARN("processFrame(): failed to convert pixel type!");
+            return;
+        }
+
+        // buffer size check
+        if (stConvertParam.nDstLen == 0 || stConvertParam.nDstLen > image_buffer_size_)
+        {
+            ROS_WARN("converted size %u excced buffer size %zu,drop this frame.", stConvertParam.nDstLen, image_buffer_size_);
+            return;
+        }
+
+        // 同步时间戳
+        const ros::Time stamp = ros::Time::now();
+        image_.header.stamp = stamp;
+        image_.header.seq++;
+        info_.header.stamp = stamp;
+        image_.width = width;
+        image_.height = height;
+        image_.step = width * 3;
+        image_.encoding = "bgr8";
+        image_.is_bigendian = 0;
+        info_.width = width;
+        info_.height = height;
+
+        if (image_.data.size() < stConvertParam.nDstLen) image_.data.resize(stConvertParam.nDstLen);
+        memcpy(&image_.data[0], img_, stConvertParam.nDstLen);
+        pub_.publish(image_, info_);
+
+        //
+
+    }
+
+
+    // 目前是根据实时图像进行扩容，但是相机最大分辨率和平时的参数一样:1440*1080
+    // 可以修改此函数以保证使用的大小最终与相机或参数的一致
+    bool HKCameraNodelet::ensureBufferLocked(const uint32_t width, const uint32_t height)
+    {
+        const uint64_t needed =
+            static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 3ULL;
+        if (needed == 0)
+            return false;
+        if (img_ != nullptr && image_buffer_size_ >= needed)
+            return true;
+
+        const auto new_buffer = new(std::nothrow) unsigned char[needed];
+        if (new_buffer == nullptr)
+        {
+            ROS_ERROR_THROTTLE(1.0, "[hk_fix] realloc image buffer %llu bytes failed.",
+                               static_cast<unsigned long long>(needed));
+            return false;
+        }
+        delete[] img_;
+        img_ = new_buffer;
+        image_buffer_size_ = static_cast<size_t>(needed);
+        ROS_WARN("[hk_fix] image buffer enlarged to %llu bytes for frame %ux%u",
+                 static_cast<unsigned long long>(needed), width, height);
+        return true;
     }
 
     void HKCameraNodelet::reconfigCB(CameraConfig& config, uint32_t level)
@@ -667,13 +791,14 @@ namespace hk_camera
         }
     }
 
-    void* HKCameraNodelet::dev_handle_ = nullptr;
-    unsigned char* HKCameraNodelet::img_;
-    sensor_msgs::Image HKCameraNodelet::image_;
+    // 消除static成员，为多相机做准备
+    // void* HKCameraNodelet::dev_handle_ = nullptr;
+    // unsigned char* HKCameraNodelet::img_;
+    // sensor_msgs::Image HKCameraNodelet::image_;
     //sensor_msgs::Image HKCameraNodelet::image_rect;
-    image_transport::CameraPublisher HKCameraNodelet::pub_;
-    ros::Publisher HKCameraNodelet::pub_rect_;
-    sensor_msgs::CameraInfo HKCameraNodelet::info_;
+    // image_transport::CameraPublisher HKCameraNodelet::pub_;
+    // ros::Publisher HKCameraNodelet::pub_rect_;
+    // sensor_msgs::CameraInfo HKCameraNodelet::info_;
     //int HKCameraNodelet::width_{};
     //std::string HKCameraNodelet::imu_name_;
     //std::string HKCameraNodelet::camera_name_;
@@ -686,8 +811,8 @@ namespace hk_camera
     // bool HKCameraNodelet::take_photo_{};
     // struct TriggerPacket HKCameraNodelet::fifo_[FIFO_SIZE];
     // uint32_t HKCameraNodelet::receive_trigger_counter_ = 0;
-    bool HKCameraNodelet::enable_resolution_ = false;
-    int HKCameraNodelet::resolution_ratio_width_ = 1440;
-    int HKCameraNodelet::resolution_ratio_height_ = 1080;
+    // bool HKCameraNodelet::enable_resolution_ = false;
+    // int HKCameraNodelet::resolution_ratio_width_ = 1440;
+    // int HKCameraNodelet::resolution_ratio_height_ = 1080;
     // bool HKCameraNodelet::camera_restart_flag_{};
 } // namespace hk_camera
