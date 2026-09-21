@@ -1,5 +1,20 @@
 <launch>
-    <arg name="enable_imu_trigger" default="false"/>
+    <!-- 单机（一台相机）启动。
+         参数分两处，职责别混：
+           - 本文件：接口/身份类（相机名、SN、分辨率、缩放话题相关）
+           - config/hk_camera_config.yaml（顶层键 hk_camera → /hk_camera/hk_camera）：影像类
+         同名参数不要两处都写；写重了以 yaml 为准，启动日志会告警。
+         camera_sn 只在"同机枚举到多台相机"时用于严格配对；只插一台时该值被忽略（代码直接采用设备 SN）。
+         本机当前两台在线设备为 DA5510091(左) / DA5116172(右)，单机调试可临时覆盖：
+             roslaunch hk_camera single_device.launch camera_sn:=DA5510091
+         话题命名（2026-09 复核，勿随手改）：
+           - /hk_camera/image_raw、/hk_camera/image_raw_down、/image_rect：发布名保持原样，
+             rm_forecast 等包按 /hk_camera/image_raw 订阅，改名即断链
+           - /camera_name、/camera_stop：沿用上游的**全局名**（rm_referee 直接订阅 /camera_name），
+             节点里是 nh_.subscribe("/camera_name")，不要改成节点私有名，否则外部"切换/启停相机"
+             指令收不到 -->
+    <arg name="camera_sn" default="DA5510091"/>
+
     <node pkg="nodelet" type="nodelet" name="vision_nodelet" args="manager"
           output="screen"/>
     <node pkg="nodelet" type="nodelet" name="hk_camera"
@@ -8,22 +23,22 @@
         <param name="camera_name" value="hk_camera"/>
         <param name="image_width" value="1440"/>
         <param name="image_height" value="1080"/>
-        <param name="pixel_format" value="bgr8"/>
+        <!-- RG8(BayerRG8) 必须保留：1440x1080 下实测上限 165.369fps(PayloadSize 1555200)。
+             换成 RGB8/BGR8 后 Gamma 节点才可写，但帧率掉到 79.227fps，赛场不可接受；
+             所以 RG8 下 Gamma 不可用属预期（详见 config/hk_camera_config.yaml 注释）。 -->
+        <param name="pixel_format" value="RG8"/>
         <param name="camera_info_url" value=""/>
         <param name="camera_frame_id" value="camera_optical_frame"/>
-        <param name="camera_id" value="camera_optical_frame"/>
-        <param name="camera_sn" value="DA5510091"/>
-        <param name="frame_rate" value="200"/>
-        <param name="enable_imu_trigger" value="$(arg enable_imu_trigger)"/>
-        <param name="gain_value" value="14"/>
-        <param name="gain_auto" value="false"/>
-        <param name="exposure_value" value="2000"/>
-        <param name="gamma_selector" value="2"/>
-        <param name="gamma_value" value="0.7"/>
+        <param name="camera_sn" value="$(arg camera_sn)"/>
+        <!-- 1440x1080/RG8 的实际上限（实测 165.369fps）。写 200 会被相机静默钳位，
+             日志再报出 165.369 容易让人误判"没生效"，直接写实测上限。 -->
+        <param name="frame_rate" value="165.4"/>
+        <!-- 缩放话题 /image_rect 的总开关与目标尺寸（代码里叫 ratio，实际是 cv::resize 的目标宽高）。
+             本机下游按 1440x1080 全尺寸取（等于不缩放）；enable_resolution=false 或不给正数时
+             节点干脆不广告 /image_rect（下游会一直等不到图）。 -->
         <param name="enable_resolution" value="true"/>
         <param name="resolution_ratio_width" value="1440"/>
         <param name="resolution_ratio_height" value="1080"/>
         <rosparam command="load" file="$(find hk_camera)/config/hk_camera_config.yaml" />
-        <remap from="/hk_camera/imu_trigger" to="/rm_ecat_hw/imu_trigger"/>
     </node>
 </launch>

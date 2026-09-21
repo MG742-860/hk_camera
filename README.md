@@ -22,7 +22,9 @@ sudo apt-get install ros-noetic-image-transport-plugins
 1. 小电脑上停掉所有视觉服务(标定帧率低)，单跑相机
 ```shell
 stopvi
-mon launch hk_camera singe_device.launch
+mon launch hk_camera single_device.launch
+# 本机两台在线设备为 DA5510091 / DA5116172，默认用 DA5510091；要标定另一台：
+mon launch hk_camera single_device.launch camera_sn:=DA5116172
 ```
 
 2. 在自己电脑上跑标定程序
@@ -62,6 +64,28 @@ scp xxxx.yaml dynamicx@192.168.100.2:/home/dynamicx/.ros/camera_info/
 More information:
 
 - http://wiki.ros.org/image_pipeline
+
+# 话题与参数约定（2026-09 复核，改名前先确认下游）
+
+| 名字 | 类型 | 说明 |
+| --- | --- | --- |
+| `/hk_camera/image_raw` | Image/CameraInfo | 主出图（BGR8）。`rm_forecast` 等按这个名字订阅，改名即断链 |
+| `/hk_camera/image_raw_down` | Image | `is_fps_down=true` 时的降频副本（`target_fps` 控制） |
+| `/image_rect` | Image | 缩放副本，**全局名**（上游即如此）。需 `enable_resolution=true` + 正的 `resolution_ratio_*`；双机用 remap 改成 `/image_rect_left`、`/image_rect_right` |
+| `/camera_name` | String | 相机切换指令（**全局名**，上游即如此）：内容等于本机 `camera_name`/节点名时恢复取流，否则停止取流。`rm_referee` 也订阅这个名字 |
+| `/camera_stop` | Bool | 全局启停取流：`true` 停止、`false` 恢复 |
+| `/hk_camera/exposure_status_switch` | rm_msgs/StatusChange | 按 `target` 切曝光：true→`exposure_value_windmill`，false→`exposure_value` |
+
+参数分两处，职责别混：
+
+- `launch/*.launch`：接口/身份类（`camera_name`、`camera_sn`、分辨率、`frame_rate`、`enable_resolution`/`resolution_ratio_*`）
+- `config/hk_camera_config.yaml`（顶层键 `hk_camera`）：影像类（gain/exposure/gamma/white/fps_down）。
+  与 launch 同名参数重复且取值不同时以 yaml 为准，启动日志会打印来源清单并告警冲突；
+  运行时用 `rqt_reconfigure` 试值，定好后写回 yaml（rqt 不落盘）。
+
+帧率/像素格式实测（MV-CS016-10UC @1440x1080）：`RG8` 165.369fps（现用，Gamma 节点不可写属预期）、
+`RGB8`/`BGR8` 79.227fps、`YUV422` 118.840fps、`Mono8` 165.369fps。双机同开约 514MB/s 超 USB3 实用带宽，
+需要各自降 `frame_rate`。
 
 # Other Warnings
 ## 1. 相机强制使用libMvCameraControl.so

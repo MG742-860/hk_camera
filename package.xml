@@ -32,6 +32,8 @@
     <exec_depend>image_transport_plugins</exec_depend>
     <exec_depend>message_runtime</exec_depend>
     <exec_depend>cv_bridge</exec_depend>
+    <!-- 运行期依赖：/hk_camera/exposure_status_switch 服务用的是 rm_msgs/StatusChange -->
+    <exec_depend>rm_msgs</exec_depend>
     <!-- The export tag contains other, unspecified, tags -->
     <export>
         <!-- Other tools can request additional information be placed here -->

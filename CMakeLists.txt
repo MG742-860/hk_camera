@@ -29,8 +29,10 @@ generate_dynamic_reconfigure_options(
 
 catkin_package(
         LIBRARIES hk_camera
+        # rm_msgs(服务 rm_msgs/StatusChange)与 cv_bridge 出现在对外头文件/链接里，按 catkin 规范一并导出。
+        # 本工作区目前没有其它包 find_package(hk_camera)，属于补正确性、不影响现有构建。
         CATKIN_DEPENDS nodelet roscpp dynamic_reconfigure
-        image_transport camera_info_manager
+        image_transport camera_info_manager rm_msgs cv_bridge
 )
 
 include_directories(
