@@ -147,8 +147,14 @@ namespace hk_camera
             getParamAligned("resolution_ratio_width", resolution_ratio_width_, 1440);
             getParamAligned("resolution_ratio_height", resolution_ratio_height_, 1080);
             getParamAligned("stop_grab", stop_grab_, false);
-            getParamAligned("is_fps_down", is_fps_down_, false);
-            getParamAligned("target_fps", target_fps_, 40.0);
+            // 抽帧参数是原子成员（reconfigCB 写 / 图像回调读），而 getParamAligned 需要"可写引用"，
+            // 因此先落到局部变量再 store：参数来源自检逻辑(reportParamSources)不受影响。
+            bool is_fps_down_param = false;
+            getParamAligned("is_fps_down", is_fps_down_param, false);
+            is_fps_down_.store(is_fps_down_param);
+            double target_fps_param = 40.0;
+            getParamAligned("target_fps", target_fps_param, 40.0);
+            target_fps_.store(target_fps_param);
         }
         // 启动自检：把每个参数的实际来源与"同一参数两处定义且不一致"的情况打出来
         reportParamSources();
@@ -277,7 +283,9 @@ namespace hk_camera
         // MV_CC_CreateHandle 的 handle 参数是 [IN][OUT]：传入非空句柄时 SDK 会直接覆盖旧句柄，
         // 旧句柄既不会 StopGrabbing、也不会注销回调/CloseDevice/DestroyHandle，结果是"自己占着自己"，
         // 之后 OpenDevice 会返回 0x80000203(设备无访问权限)。所以枚举配对前必须先彻底释放旧句柄。
-        if (dev_handle_ != nullptr) releaseDevice(false);
+        // releaseDevice() 自己持 dev_mutex_（内部判空），这里必须在**锁外**调用；下面的 sleep/枚举
+        // （最长 sleep_time_ 秒 + USB 扫描）也刻意留在锁外，避免长时间占锁拖住配置/服务回调。
+        releaseDevice(false);
 
         // 官方建议的释放顺序：停止取流 → 注销回调 → 关闭设备 → 销毁句柄
         auto release_handle = [](void* handle)
@@ -352,6 +360,11 @@ namespace hk_camera
                       stDeviceList.nDeviceNum, mis_match, camera_sn_.c_str());
             return false;
         }
+
+        // 从这里开始的"创建 → 打开 → 配置 → 注册回调 → 赋句柄 → 取流"全程持 dev_mutex_：
+        // 期间 dev_handle_ 可能为空或指向半初始化的句柄，其它线程（配置/服务/订阅/析构）
+        // 必须等锁，绝不允许拿旧句柄或半初始化句柄去调 SDK。
+        std::unique_lock<std::mutex> dev_lock(dev_mutex_);
 
         // 只对命中的那一台创建句柄并打开
         void* handle = nullptr; // 局部句柄：配对+配置+取流全部成功后，才交给 dev_handle_
@@ -462,13 +475,15 @@ namespace hk_camera
         }
 
         // 句柄交给成员变量：图像回调里要用它做 MV_CC_ConvertPixelType，必须在 StartGrabbing 之前赋值
-        dev_handle_ = handle;
+        // （setDevHandleLocked 会同时刷新热路径快照 dev_handle_snapshot_，见头文件注释）
+        setDevHandleLocked(handle);
         need_grab_ = false;
 
         nRet = MV_CC_StartGrabbing(handle);
         if (nRet != MV_OK)
         {
             ROS_ERROR("Stream On failed! nRet: %d", nRet);
+            dev_lock.unlock(); // releaseDevice() 自己持同一把锁，必须先解锁再调用（否则自锁死）
             releaseDevice(false);
             return false;
         }
@@ -488,12 +503,20 @@ namespace hk_camera
         const double first_frame_timeout_sec = 5.0;
         const double no_frame_timeout_sec = 2.0;
 
-        // 掉线判定：异常回调置位 / 句柄为空 / 连接状态查询失败
-        bool dev_lost = need_reconnect_ || dev_handle_ == nullptr || !MV_CC_IsDeviceConnected(dev_handle_);
+        // 掉线判定：异常回调置位 / 句柄为空 / 连接状态查询失败。
+        // 本段持 dev_mutex_ 取句柄快照，保证 MV_CC_IsDeviceConnected() 用到的句柄不会在调用
+        // 中途被别的线程销毁；has_handle 供后面"是否需要释放旧句柄"判断复用。
+        bool dev_lost = true;
+        bool has_handle = false;
+        {
+            std::lock_guard<std::mutex> dev_lock(dev_mutex_);
+            has_handle = (dev_handle_ != nullptr);
+            dev_lost = need_reconnect_ || !has_handle || !MV_CC_IsDeviceConnected(dev_handle_);
+        }
 
         // 兜底判定：有些异常（实测 USB 总线复位后取流管道已断）设备仍报"已连接"，
         // 表现是图像停了但怎么查都查不出掉线，只能靠"长时间没有帧回调"来判定
-        if (!dev_lost && dev_handle_ != nullptr && !need_grab_)
+        if (!dev_lost && has_handle && !need_grab_)
         {
             const double now_sec = ros::WallTime::now().toSec();
             const double last_active = got_frame_ ? last_frame_sec_ : stream_on_sec_; // 出过图比"最后一帧"，否则比"Stream On"
@@ -513,7 +536,7 @@ namespace hk_camera
         const ros::WallTime now = ros::WallTime::now();
         if (!next_reconnect_time_.isZero() && now < next_reconnect_time_) return;
 
-        if (dev_handle_ != nullptr)
+        if (has_handle)
         {
             ROS_WARN("timerCallback(): camera lost, target SN:%s, reconnect now.", camera_sn_.c_str());
             need_reconnect_ = false;
@@ -599,6 +622,9 @@ namespace hk_camera
     bool HKCameraNodelet::changeStatusCB(rm_msgs::StatusChange::Request& change, rm_msgs::StatusChange::Response& res)
     {
         res.switch_is_success = false;
+        // 本回调跑在 ROS 服务线程，与重连线程（timerCallback）并发：持 dev_mutex_ 保证
+        // 下面用到的句柄在本次调用期间不会被销毁。
+        std::lock_guard<std::mutex> dev_lock(dev_mutex_);
         if (dev_handle_ == nullptr)
         {
             ROS_WARN("changeStatusCB(): camera not ready (dev_handle_ is null), reject switch.");
@@ -628,6 +654,8 @@ namespace hk_camera
 
     void HKCameraNodelet::cameraChange(const std_msgs::String& camera_change)
     {
+        // 订阅回调在 ROS spinner 线程执行，与重连线程并发：持 dev_mutex_ 保证句柄生命周期
+        std::lock_guard<std::mutex> dev_lock(dev_mutex_);
         if (dev_handle_ == nullptr) return;
         try
         {
@@ -660,6 +688,8 @@ namespace hk_camera
 
     void HKCameraNodelet::cameraStop(const std_msgs::Bool camera_stop_msg_)
     {
+        // 订阅回调在 ROS spinner 线程执行，与重连线程并发：持 dev_mutex_ 保证句柄生命周期
+        std::lock_guard<std::mutex> dev_lock(dev_mutex_);
         if (dev_handle_ == nullptr) return;
         try
         {
@@ -732,7 +762,11 @@ namespace hk_camera
         }
         // 不再逐帧调用 MV_CC_IsDeviceConnected()：200fps 下是纯额外开销，而且会与重连线程的
         // DestroyHandle 抢用句柄。掉线改由 onExceptionCB 置位 + timerCallback 的 1Hz 轮询判定。
-        if (closing_ || dev_handle_ == nullptr) return;
+        // 热路径无锁：FrameCallbackGuard 负责"登记在途回调 + 取句柄快照"（见其类注释），
+        // 本函数后续一律使用这个快照，不再直接读 dev_handle_（return 时守卫析构自动注销在途）。
+        const FrameCallbackGuard frame_guard(closing_, frame_callbacks_inflight_, dev_handle_snapshot_);
+        void* const dev_handle = frame_guard.handle();
+        if (dev_handle == nullptr) return;
         const uint32_t width = pFrameInfo->nWidth;
         const uint32_t height = pFrameInfo->nHeight;
         if (width == 0 || height == 0)
@@ -757,7 +791,7 @@ namespace hk_camera
         stConvertParam.nDstBufferSize = static_cast<unsigned int>(
             std::min<uint64_t>(static_cast<uint64_t>(image_buffer_size_), 0xFFFFFFFFULL));
 
-        int nRet = MV_CC_ConvertPixelType(dev_handle_, &stConvertParam);
+        int nRet = MV_CC_ConvertPixelType(dev_handle, &stConvertParam);
         if (nRet != MV_OK)
         {
             ROS_WARN("processFrame(): failed to convert pixel type: 0x%08x", nRet);
@@ -814,11 +848,15 @@ namespace hk_camera
             }
         }
 
-        if (is_fps_down_)
+        // 抽帧参数是原子成员：热路径各取一次快照（RELAXED 足够，只是发布节流判断，
+        // 与句柄关闭/重连的同步无关），避免反复读原子
+        const bool fps_down = is_fps_down_.load(std::memory_order_relaxed);
+        const double target_fps = target_fps_.load(std::memory_order_relaxed);
+        if (fps_down)
         {
             bool pub_down_sample = false;
             const ros::WallTime now = ros::WallTime::now();
-            const ros::WallDuration interval(1.0 / std::max(target_fps_, 1.0));
+            const ros::WallDuration interval(1.0 / std::max(target_fps, 1.0));
             {
                 std::lock_guard<std::mutex> fps_lock(fps_down_mutex_);
                 if (next_pub_time_.isZero())
@@ -865,6 +903,28 @@ namespace hk_camera
 
     void HKCameraNodelet::reconfigCB(CameraConfig& config, uint32_t level)
     {
+        // dynamic_reconfigure 回调外壳：唯一职责是把异常挡在 ROS 回调边界之内。
+        // 本包所有 CHECK_MVS 都是 warn 模式（不抛），但 SDK 调用/字符串处理仍可能抛；
+        // 一旦异常穿过 dynamic_reconfigure 的服务回调，ROS 会直接 terminate 整个 nodelet 进程。
+        try
+        {
+            reconfigApply(config, level);
+        }
+        catch (const std::exception& e)
+        {
+            ROS_ERROR("reconfigCB(): exception ignored: %s", e.what());
+        }
+        catch (...)
+        {
+            ROS_ERROR("reconfigCB(): unknown exception ignored.");
+        }
+    }
+
+    void HKCameraNodelet::reconfigApply(CameraConfig& config, uint32_t level)
+    {
+        // 配置线程（dynamic_reconfigure 服务）与重连线程并发：全程持 dev_mutex_，
+        // 与 initializeCamera()/releaseDevice() 串行化"句柄生命周期 + SDK 参数写"。
+        std::lock_guard<std::mutex> dev_lock(dev_mutex_);
         (void)level;
         // Launch setting
         if (initialize_flag_)
@@ -884,8 +944,8 @@ namespace hk_camera
             config.white_auto = white_auto_;
             config.white_selector = white_selector_;
             config.stop_grab = stop_grab_;
-            config.is_fps_down = is_fps_down_;
-            config.target_fps = target_fps_;
+            config.is_fps_down = is_fps_down_.load();
+            config.target_fps = target_fps_.load();
             initialize_flag_ = false;
         }
         if (dev_handle_ == nullptr) return;
@@ -1009,8 +1069,8 @@ namespace hk_camera
 
 
         // take_photo_ = config.take_photo;
-        is_fps_down_ = config.is_fps_down;
-        target_fps_ = std::max(config.target_fps, 1.0);
+        is_fps_down_.store(config.is_fps_down);
+        target_fps_.store(std::max(config.target_fps, 1.0));
         std::lock_guard<std::mutex> lock(fps_down_mutex_);
         next_pub_time_ = ros::WallTime();
         //  Width offset of image
@@ -1032,6 +1092,7 @@ namespace hk_camera
 
     void HKCameraNodelet::closeDevice(const bool tf)
     {
+        // 前置条件：调用方已持 dev_mutex_（releaseDevice() 持锁后调进来，见其注释）
         if (dev_handle_ == nullptr) return;
 
         // 注意：这里不能再把 MV_CC_IsDeviceConnected(dev_handle_) 当清理的前置条件。
@@ -1040,6 +1101,9 @@ namespace hk_camera
         // 重连就永远失败。所以清理动作无条件执行，错误码只告警。
         (void)tf; // tf 仅为兼容旧调用保留：清理阶段一律 warn-only，保证清理一定执行到底
         closing_ = true; // 通知图像回调线程立即放弃后续帧（无锁标志，避免与 DestroyHandle 抢句柄）
+        // 等一下"已经进了回调、还没退出"的那一帧：它可能正拿着这个句柄做 MV_CC_ConvertPixelType，
+        // 必须等它退出后才可 StopGrabbing/CloseDevice/DestroyHandle（否则是 use-after-free）。
+        drainFrameCallbacks();
         try
         {
             if (!need_grab_) CHECK_MVS(MV_CC_StopGrabbing(dev_handle_), false);
@@ -1057,6 +1121,9 @@ namespace hk_camera
 
     void HKCameraNodelet::releaseDevice(const bool tf)
     {
+        // 本函数自己持 dev_mutex_：调用方（initializeCamera/timerCallback/析构）必须在**锁外**调用，
+        // 否则自锁死。closeDevice() 依赖"本函数已持锁"这一前置条件。
+        std::lock_guard<std::mutex> dev_lock(dev_mutex_);
         if (dev_handle_ == nullptr)
         {
             closing_ = false;
@@ -1074,10 +1141,36 @@ namespace hk_camera
         }
         // 无论成功与否都必须置空：否则下一次 MV_CC_CreateHandle 会带着旧句柄去创建，
         // 旧设备资源不释放、新句柄也打不开设备(0x80000203)
-        dev_handle_ = nullptr;
+        setDevHandleLocked(nullptr);
         need_grab_ = false;
         closing_ = false;
         got_frame_ = false; // 新句柄重新开始计帧看门狗
+    }
+
+    // 句柄写入口：dev_handle_（锁内读写）与 dev_handle_snapshot_（图像回调热路径无锁读）必须同步
+    // 更新，集中到这里改写，避免以后漏掉其中一处。**必须持 dev_mutex_ 调用**。
+    void HKCameraNodelet::setDevHandleLocked(void* handle)
+    {
+        dev_handle_ = handle;
+        dev_handle_snapshot_.store(handle, std::memory_order_release);
+    }
+
+    // 等待在途图像回调退出。**必须持 dev_mutex_ 调用**，且只在 closeDevice() 里用：
+    // 正常 165fps 下在途回调数是 0~1，循环立刻返回；超时（例如 SDK 回调卡死）只告警不阻断，
+    // 因为紧接着的 MV_CC_RegisterImageCallBackEx(nullptr) 已保证 SDK 不再投递新回调。
+    void HKCameraNodelet::drainFrameCallbacks()
+    {
+        const int drain_timeout_ms = 500;
+        const ros::WallTime deadline = ros::WallTime::now() + ros::WallDuration(drain_timeout_ms / 1000.0);
+        int inflight = frame_callbacks_inflight_.load(std::memory_order_acquire);
+        while (inflight > 0 && ros::WallTime::now() < deadline)
+        {
+            ros::WallDuration(0.001).sleep();
+            inflight = frame_callbacks_inflight_.load(std::memory_order_acquire);
+        }
+        if (inflight > 0)
+            ROS_WARN_THROTTLE(1.0, "drainFrameCallbacks(): %d image callback(s) still in flight "
+                                    "after %d ms, continue cleanup anyway.", inflight, drain_timeout_ms);
     }
 
     bool HKCameraNodelet::validateDimensions(void* handle, int width, int height, int offset_x, int offset_y)
